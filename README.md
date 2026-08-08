@@ -1,7 +1,7 @@
 # fsm-rs
 
 [![crates.io](https://img.shields.io/crates/v/fsm-rs.svg)](https://crates.io/crates/fsm-rs)
-[![CI](https://github.com/mudake/fsm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mudake/fsm-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/mudake-rs/fsm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mudake-rs/fsm-rs/actions/workflows/ci.yml)
 
 An Akka-inspired finite state machine library for Rust with a table-style DSL,
 **compile-time transition exhaustiveness**, first-class **async** support and
