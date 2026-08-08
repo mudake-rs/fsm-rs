@@ -12,7 +12,7 @@ fsm-rs = { version = "0.1.1", path = "fsm-rs" }
 version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mudake/fsm-rs"
+repository = "https://github.com/mudake-rs/fsm-rs"
 readme = "README.md"
 
 [workspace.lints.clippy]
