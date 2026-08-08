@@ -14,3 +14,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mudake/fsm-rs"
 readme = "README.md"
+
+[workspace.lints.clippy]
+# Strict by default; curated allows below. Fix lints, don't sprinkle `allow`
+# attributes — extend this list only after consideration.
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"

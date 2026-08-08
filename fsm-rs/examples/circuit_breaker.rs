@@ -2,7 +2,7 @@
 //! the minimal "actor mailbox" pattern. The core library is runtime-agnostic;
 //! the mailbox loop here is plain user code.
 //!
-//! Run with: cargo run --example circuit_breaker
+//! Run with: `cargo run --example circuit_breaker`
 
 use fsm_rs::state_machine;
 use tokio::sync::mpsc;

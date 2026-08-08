@@ -1,7 +1,9 @@
 use syn::parse::{Parse, ParseStream};
 use syn::{braced, bracketed, parenthesized, Ident, LitBool, Token, Type};
 
-use crate::model::*;
+use crate::model::{
+    Callable, EventPattern, MachineDef, Row, SourcePattern, StateDef, StateRef, Target, Unhandled,
+};
 
 impl Parse for MachineDef {
     fn parse(input: ParseStream) -> syn::Result<Self> {
@@ -22,19 +24,19 @@ impl Parse for MachineDef {
                 "context" => set_once(&mut context, input.parse::<Type>()?, &kw)?,
                 "serde" => serde = input.parse::<LitBool>()?.value,
                 "states" => {
-                    let content;
-                    braced!(content in input);
-                    set_once(&mut states, parse_states(&content)?, &kw)?;
+                    let block;
+                    braced!(block in input);
+                    set_once(&mut states, parse_states(&block)?, &kw)?;
                 }
                 "events" => {
-                    let content;
-                    braced!(content in input);
-                    set_once(&mut events, parse_events(&content)?, &kw)?;
+                    let block;
+                    braced!(block in input);
+                    set_once(&mut events, parse_events(&block)?, &kw)?;
                 }
                 "transitions" => {
-                    let content;
-                    braced!(content in input);
-                    set_once(&mut transitions, parse_rows(&content)?, &kw)?;
+                    let block;
+                    braced!(block in input);
+                    set_once(&mut transitions, parse_rows(&block)?, &kw)?;
                 }
                 "unhandled" => {
                     let value = parse_unhandled(input)?;

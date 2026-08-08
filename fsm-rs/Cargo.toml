@@ -9,6 +9,9 @@ description = "Akka-inspired async FSM library with compile-time transition exha
 keywords = ["fsm", "state-machine", "statechart", "async", "macro"]
 categories = ["data-structures", "asynchronous"]
 
+[lints]
+workspace = true
+
 [dependencies]
 fsm-rs-macros.workspace = true
 async-trait = "0.1"
