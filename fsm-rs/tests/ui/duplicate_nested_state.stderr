@@ -1,0 +1,5 @@
+error: duplicate state `A`
+ --> tests/ui/duplicate_nested_state.rs:9:27
+  |
+9 |     states: { *A, P { *B, A } },
+  |                           ^

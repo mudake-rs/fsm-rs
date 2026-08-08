@@ -135,11 +135,26 @@ fn parse_states(input: ParseStream) -> syn::Result<Vec<StateDef>> {
                 }
             }
         }
+        let children = if input.peek(syn::token::Brace) {
+            let content;
+            braced!(content in input);
+            let children = parse_states(&content)?;
+            if children.is_empty() {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!("composite state `{name}` has an empty child block"),
+                ));
+            }
+            children
+        } else {
+            Vec::new()
+        };
         states.push(StateDef {
             name,
             initial,
             entry,
             exit,
+            children,
         });
         if input.peek(Token![,]) {
             input.parse::<Token![,]>()?;

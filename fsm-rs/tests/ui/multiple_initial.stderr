@@ -1,4 +1,4 @@
-error: multiple initial states: `A` and `B`; only one state may be marked with `*`
+error: multiple initial states in the top level: `A` and `B`; only one state may be marked with `*`
  --> tests/ui/multiple_initial.rs:9:20
   |
 9 |     states: { *A, *B },
