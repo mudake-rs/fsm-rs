@@ -5,7 +5,7 @@
 //!   * `async` prefixes in the DSL — this makes `process_event` async too;
 //!   * `#[fsm_rs::async_trait]` on the context trait implementation.
 //!
-//! Run with: cargo run --example async_job
+//! Run with: `cargo run --example async_job`
 
 use std::time::Duration;
 

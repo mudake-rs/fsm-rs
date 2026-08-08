@@ -22,18 +22,6 @@ impl<'a> Tree<'a> {
             by_name: HashMap::new(),
             parent: HashMap::new(),
         };
-        fn walk<'a>(states: &'a [StateDef], parent: Option<String>, tree: &mut Tree<'a>) {
-            for s in states {
-                tree.all.push(s);
-                tree.by_name.insert(s.name.to_string(), s);
-                tree.parent.insert(s.name.to_string(), parent.clone());
-                if s.children.is_empty() {
-                    tree.leaves.push(s);
-                } else {
-                    walk(&s.children, Some(s.name.to_string()), tree);
-                }
-            }
-        }
         walk(states, None, &mut tree);
         tree
     }
@@ -155,6 +143,21 @@ impl<'a> Tree<'a> {
     }
 }
 
+/// Recursive pre-order walk filling the tree's index structures.
+fn walk<'a>(states: &'a [StateDef], parent: Option<&str>, tree: &mut Tree<'a>) {
+    for s in states {
+        tree.all.push(s);
+        tree.by_name.insert(s.name.to_string(), s);
+        tree.parent
+            .insert(s.name.to_string(), parent.map(str::to_string));
+        if s.children.is_empty() {
+            tree.leaves.push(s);
+        } else {
+            walk(&s.children, Some(&s.name.to_string()), tree);
+        }
+    }
+}
+
 /// Finds a state by name anywhere in the tree, mutably.
 pub fn find_mut<'a>(states: &'a mut [StateDef], name: &str) -> Option<&'a mut StateDef> {
     for s in states.iter_mut() {
@@ -203,7 +206,7 @@ mod tests {
         ]
     }
 
-    fn names(path: Vec<&StateDef>) -> Vec<String> {
+    fn names(path: &[&StateDef]) -> Vec<String> {
         path.iter().map(|s| s.name.to_string()).collect()
     }
 
@@ -250,26 +253,26 @@ mod tests {
         let tree = Tree::new(&states);
 
         // sibling move inside Discharging: only the two leaves
-        assert_eq!(names(tree.exit_path("Slow", "Fast")), ["Slow"]);
-        assert_eq!(names(tree.entry_path("Slow", "Fast")), ["Fast"]);
+        assert_eq!(names(&tree.exit_path("Slow", "Fast")), ["Slow"]);
+        assert_eq!(names(&tree.entry_path("Slow", "Fast")), ["Fast"]);
 
         // cross-boundary: Slow -> Done
         assert_eq!(
-            names(tree.exit_path("Slow", "Done")),
+            names(&tree.exit_path("Slow", "Done")),
             ["Slow", "Discharging", "Active"]
         );
-        assert_eq!(names(tree.entry_path("Slow", "Done")), ["Done"]);
+        assert_eq!(names(&tree.entry_path("Slow", "Done")), ["Done"]);
 
         // entering a composite from outside: Idle -> Slow (target resolved)
-        assert_eq!(names(tree.exit_path("Idle", "Slow")), ["Idle"]);
+        assert_eq!(names(&tree.exit_path("Idle", "Slow")), ["Idle"]);
         assert_eq!(
-            names(tree.entry_path("Idle", "Slow")),
+            names(&tree.entry_path("Idle", "Slow")),
             ["Active", "Discharging", "Slow"]
         );
 
         // self transition: exit and re-enter the leaf only
-        assert_eq!(names(tree.exit_path("Slow", "Slow")), ["Slow"]);
-        assert_eq!(names(tree.entry_path("Slow", "Slow")), ["Slow"]);
+        assert_eq!(names(&tree.exit_path("Slow", "Slow")), ["Slow"]);
+        assert_eq!(names(&tree.entry_path("Slow", "Slow")), ["Slow"]);
     }
 
     #[test]

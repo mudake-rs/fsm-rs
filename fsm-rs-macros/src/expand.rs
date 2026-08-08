@@ -5,7 +5,9 @@ use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::Ident;
 
-use crate::model::*;
+use crate::model::{
+    Callable, EventPattern, MachineDef, Row, SourcePattern, StateDef, Target, Unhandled,
+};
 use crate::tree::{find_mut, Tree};
 
 pub fn expand(def: &mut MachineDef) -> syn::Result<TokenStream> {
@@ -74,8 +76,21 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
     }
 
     let tree = Tree::new(&def.states);
+    validate_names(def, &tree, &mut errors);
+    check_initial_levels(&def.states, None, &mut errors);
+    validate_callable_kinds(def, &tree, &mut errors);
+    validate_coverage(def, &tree, &mut errors);
 
-    // Duplicate names across the whole tree (one namespace).
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(combine(errors))
+    }
+}
+
+/// Duplicate names (states share one namespace across the whole tree) and
+/// references to unknown states/events in rows.
+fn validate_names(def: &MachineDef, tree: &Tree, errors: &mut Vec<syn::Error>) {
     let mut seen_states: HashSet<String> = HashSet::new();
     for s in &tree.all {
         if !seen_states.insert(s.name.to_string()) {
@@ -92,11 +107,6 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
         }
     }
 
-    // Initial-state rules: exactly one `*` child per composite; at most one
-    // `*` at the top level (default: first state).
-    check_initial_levels(&def.states, None, &mut errors);
-
-    // Unknown states / events in rows.
     for row in &def.transitions {
         if let SourcePattern::States(refs) = &row.sources {
             for r in refs {
@@ -121,9 +131,11 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
             }
         }
     }
+}
 
-    // Callable name/kind consistency: the same method name may not be used in
-    // two roles with different signatures.
+/// Callable name/kind consistency: the same method name may not be used in
+/// two roles with different signatures.
+fn validate_callable_kinds(def: &MachineDef, tree: &Tree, errors: &mut Vec<syn::Error>) {
     let mut callable_kinds: Vec<(String, &'static str, proc_macro2::Span)> = Vec::new();
     {
         let mut note = |c: &Callable, kind: &'static str| {
@@ -167,9 +179,12 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
             }
         }
     }
+}
 
-    // Coverage over (leaf x event) pairs.
-    let rows = row_infos(def, &tree);
+/// Unreachable-row detection and the exhaustiveness check over the flattened
+/// (leaf x event) matrix.
+fn validate_coverage(def: &MachineDef, tree: &Tree, errors: &mut Vec<syn::Error>) {
+    let rows = row_infos(def, tree);
     let n_leaves = tree.leaves.len();
     let n_events = def.events.len();
 
@@ -226,7 +241,7 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
             let shown = missing.len().min(8);
             let mut list = missing[..shown].join(", ");
             if missing.len() > shown {
-                list.push_str(&format!(" and {} more", missing.len() - shown));
+                list = format!("{list} and {} more", missing.len() - shown);
             }
             errors.push(syn::Error::new(
                 def.name.span(),
@@ -238,12 +253,6 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
                 ),
             ));
         }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(combine(errors))
     }
 }
 
@@ -329,7 +338,7 @@ fn check_initial_levels(level: &[StateDef], parent: Option<&Ident>, errors: &mut
         .filter(|s| s.initial)
         .map(|s| &s.name)
         .collect();
-    let first = starred.first().map(|i| i.to_string());
+    let first = starred.first().map(ToString::to_string);
     for s in &starred[starred.len().min(1)..] {
         if Some(s.to_string()) != first {
             let where_ = match parent {
@@ -405,92 +414,8 @@ fn generate(def: &MachineDef) -> TokenStream {
 
     let state_variants: Vec<&Ident> = tree.leaves.iter().map(|s| &s.name).collect();
     let event_variants: Vec<&Ident> = def.events.iter().collect();
-
-    // Trait methods, deduplicated by name (validation guarantees consistent roles).
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut methods: Vec<TokenStream> = Vec::new();
-    let mut push_method = |c: &Callable, role: MethodRole| {
-        if !seen.insert(c.name.to_string()) {
-            return;
-        }
-        let m = &c.name;
-        let aw = c.is_async.then(|| quote!(async));
-        let sig = match role {
-            MethodRole::Guard => quote!(#aw fn #m(&self) -> bool;),
-            MethodRole::Mutation => quote!(#aw fn #m(&mut self);),
-            MethodRole::Unhandled => {
-                quote!(#aw fn #m(&mut self, state: &State, event: &Event);)
-            }
-            MethodRole::OnTransition => {
-                quote!(#aw fn #m(&mut self, from: &State, to: &State, event: &Event);)
-            }
-        };
-        methods.push(sig);
-    };
-    for s in &tree.all {
-        if let Some(c) = &s.entry {
-            push_method(c, MethodRole::Mutation);
-        }
-        if let Some(c) = &s.exit {
-            push_method(c, MethodRole::Mutation);
-        }
-    }
-    for row in &def.transitions {
-        if let Some(c) = &row.guard {
-            push_method(c, MethodRole::Guard);
-        }
-        if let Some(c) = &row.action {
-            push_method(c, MethodRole::Mutation);
-        }
-    }
-    if let Some(Unhandled::Method(c)) = &def.unhandled {
-        push_method(c, MethodRole::Unhandled);
-    }
-    if let Some(c) = &def.on_transition {
-        push_method(c, MethodRole::OnTransition);
-    }
-
-    let fallback = match &def.unhandled {
-        Some(Unhandled::Ignore) => quote!(Ok(())),
-        Some(Unhandled::Method(c)) => {
-            let m = &c.name;
-            let aw = await_tokens(c);
-            quote!({
-                self.context.#m(&from, &event)#aw;
-                Ok(())
-            })
-        }
-        None => quote!(Err(::fsm_rs::TransitionError::Unhandled {
-            state: from,
-            event,
-        })),
-    };
-
-    // Per-leaf dispatch arms: rows covering the leaf, in effective order
-    // (more specific sources first, then declaration order).
-    let arms: Vec<TokenStream> = tree
-        .leaves
-        .iter()
-        .enumerate()
-        .map(|(leaf_idx, leaf)| {
-            let leaf_name = &leaf.name;
-            let mut covering: Vec<&RowInfo> = rows
-                .iter()
-                .filter(|info| info.leaf_specs.iter().any(|(l, _)| *l == leaf_idx))
-                .collect();
-            covering.sort_by_key(|info| std::cmp::Reverse(info.specificity(leaf_idx)));
-            let blocks: Vec<TokenStream> = covering
-                .iter()
-                .map(|info| row_block(def, &tree, leaf, info.row))
-                .collect();
-            quote! {
-                State::#leaf_name => {
-                    #(#blocks)*
-                    #fallback
-                }
-            }
-        })
-        .collect();
+    let methods = trait_methods(def, &tree);
+    let arms = dispatch_arms(def, &tree, &rows);
 
     quote! {
         /// States of the generated state machine (leaf states of the
@@ -560,6 +485,101 @@ fn generate(def: &MachineDef) -> TokenStream {
             }
         }
     }
+}
+
+/// The generated context-trait method signatures, deduplicated by name
+/// (validation guarantees consistent roles).
+fn trait_methods(def: &MachineDef, tree: &Tree) -> Vec<TokenStream> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut methods: Vec<TokenStream> = Vec::new();
+    let mut push_method = |c: &Callable, role: MethodRole| {
+        if !seen.insert(c.name.to_string()) {
+            return;
+        }
+        let m = &c.name;
+        let aw = c.is_async.then(|| quote!(async));
+        let sig = match role {
+            MethodRole::Guard => quote!(#aw fn #m(&self) -> bool;),
+            MethodRole::Mutation => quote!(#aw fn #m(&mut self);),
+            MethodRole::Unhandled => {
+                quote!(#aw fn #m(&mut self, state: &State, event: &Event);)
+            }
+            MethodRole::OnTransition => {
+                quote!(#aw fn #m(&mut self, from: &State, to: &State, event: &Event);)
+            }
+        };
+        methods.push(sig);
+    };
+    for s in &tree.all {
+        if let Some(c) = &s.entry {
+            push_method(c, MethodRole::Mutation);
+        }
+        if let Some(c) = &s.exit {
+            push_method(c, MethodRole::Mutation);
+        }
+    }
+    for row in &def.transitions {
+        if let Some(c) = &row.guard {
+            push_method(c, MethodRole::Guard);
+        }
+        if let Some(c) = &row.action {
+            push_method(c, MethodRole::Mutation);
+        }
+    }
+    if let Some(Unhandled::Method(c)) = &def.unhandled {
+        push_method(c, MethodRole::Unhandled);
+    }
+    if let Some(c) = &def.on_transition {
+        push_method(c, MethodRole::OnTransition);
+    }
+    methods
+}
+
+/// What happens when no row fires: the `unhandled` policy or an error.
+fn fallback_tokens(def: &MachineDef) -> TokenStream {
+    match &def.unhandled {
+        Some(Unhandled::Ignore) => quote!(Ok(())),
+        Some(Unhandled::Method(c)) => {
+            let m = &c.name;
+            let aw = await_tokens(c);
+            quote!({
+                self.context.#m(&from, &event)#aw;
+                Ok(())
+            })
+        }
+        None => quote!(Err(::fsm_rs::TransitionError::Unhandled {
+            state: from,
+            event,
+        })),
+    }
+}
+
+/// Per-leaf dispatch arms: rows covering the leaf, in effective order (more
+/// specific sources first, then declaration order).
+fn dispatch_arms(def: &MachineDef, tree: &Tree, rows: &[RowInfo]) -> Vec<TokenStream> {
+    let fallback = fallback_tokens(def);
+    tree.leaves
+        .iter()
+        .enumerate()
+        .map(|(leaf_idx, leaf)| {
+            let leaf_name = &leaf.name;
+            let mut covering: Vec<&RowInfo> = rows
+                .iter()
+                .filter(|info| info.leaf_specs.iter().any(|(l, _)| *l == leaf_idx))
+                .collect();
+            covering.sort_by_key(|info| std::cmp::Reverse(info.specificity(leaf_idx)));
+            let blocks: Vec<TokenStream> = covering
+                .iter()
+                .map(|info| row_block(def, tree, leaf, info.row))
+                .collect();
+            quote! {
+                State::#leaf_name => {
+                    #(#blocks)*
+                    #fallback
+                }
+            }
+        })
+        .collect()
 }
 
 fn await_tokens(c: &Callable) -> Option<TokenStream> {

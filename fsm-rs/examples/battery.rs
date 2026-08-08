@@ -7,7 +7,7 @@
 //! * the composite row `Active + Unplug` matches from any child — exits fire
 //!   innermost-first up to the boundary.
 //!
-//! Run with: cargo run --example battery
+//! Run with: `cargo run --example battery`
 
 use fsm_rs::state_machine;
 

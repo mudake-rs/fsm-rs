@@ -5,7 +5,7 @@
 //! every piece of context data has to be serializable. Skipped fields come
 //! back as `Default::default()` after a restore.
 //!
-//! Run with: cargo run --example purchase_persist --features serde
+//! Run with: `cargo run --example purchase_persist --features serde`
 
 use fsm_rs::state_machine;
 use serde::{Deserialize, Serialize};
