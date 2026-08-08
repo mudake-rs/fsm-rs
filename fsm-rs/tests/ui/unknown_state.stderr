@@ -1,0 +1,5 @@
+error: unknown state `Nowhere`
+  --> tests/ui/unknown_state.rs:13:19
+   |
+13 |         A + Go => Nowhere,
+   |                   ^^^^^^^

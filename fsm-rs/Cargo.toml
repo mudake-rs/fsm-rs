@@ -1,0 +1,24 @@
+[package]
+name = "fsm-rs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Akka-inspired async FSM library with compile-time transition exhaustiveness"
+
+[dependencies]
+fsm-rs-macros = { version = "0.1.0", path = "../fsm-rs-macros" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+trybuild = "1"
+
+[features]
+serde = ["dep:serde"]
+
+[[example]]
+name = "purchase_persist"
+required-features = ["serde"]

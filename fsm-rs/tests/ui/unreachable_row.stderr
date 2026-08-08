@@ -1,0 +1,5 @@
+error: unreachable transition: all of its (state, event) pairs are already covered by earlier rows without guards
+  --> tests/ui/unreachable_row.rs:14:9
+   |
+14 |         A + Go => A,
+   |         ^

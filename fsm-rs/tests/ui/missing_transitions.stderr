@@ -1,0 +1,6 @@
+error: unhandled transitions in `M`: (A, Stop), (B, Go)
+       add transitions, a wildcard arm (`_ + Event => ...`), or an `unhandled:` policy
+ --> tests/ui/missing_transitions.rs:6:11
+  |
+6 |     name: M,
+  |           ^
