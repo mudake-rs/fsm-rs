@@ -2,7 +2,15 @@
 resolver = "2"
 members = ["fsm-rs", "fsm-rs-macros"]
 
+[workspace.dependencies]
+# Keep `version` in sync with workspace.package.version — required at publish
+# time (the `path` part is stripped from the published manifest).
+fsm-rs-macros = { version = "0.1.1", path = "fsm-rs-macros" }
+fsm-rs = { version = "0.1.1", path = "fsm-rs" }
+
 [workspace.package]
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mudake/fsm-rs"
+readme = "README.md"
