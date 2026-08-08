@@ -50,6 +50,58 @@
 //! machine.process_event(Event::CallFailed).unwrap();
 //! assert_eq!(machine.state(), State::Open);
 //! ```
+//!
+//! ## Hierarchical states
+//!
+//! States can nest; a composite state must mark one initial child with `*`.
+//! The generated `State` enum contains leaf states only. Dispatch is
+//! child-first (a row naming a composite covers every leaf inside it, but a
+//! row naming the leaf itself wins), and entry/exit hooks fire along the path
+//! through the least common ancestor (exits innermost-first, entries
+//! outermost-first, shared ancestors never re-fire):
+//!
+//! ```rust
+//! use fsm_rs::state_machine;
+//!
+//! struct Log(Vec<&'static str>);
+//!
+//! state_machine! {
+//!     name: Battery,
+//!     context: Log,
+//!
+//!     states: {
+//!         *Idle,
+//!         Active(entry: enter_active) {
+//!             *Charging(exit: exit_charging),
+//!             Discharging,
+//!         },
+//!         Done,
+//!     },
+//!     events: { PlugIn, Full, Empty },
+//!
+//!     transitions: {
+//!         Idle + PlugIn => Active,   // enters the initial child: Charging
+//!         Charging + Full => Discharging,
+//!         Active + Empty => Done,    // matches from any leaf inside Active
+//!         _ + PlugIn | Full | Empty => _,
+//!     }
+//! }
+//!
+//! impl BatteryContext for Log {
+//!     fn enter_active(&mut self) { self.0.push("enter Active"); }
+//!     fn exit_charging(&mut self) { self.0.push("exit Charging"); }
+//! }
+//!
+//! let mut m = Battery::new(Log(Vec::new()));
+//! m.process_event(Event::PlugIn).unwrap();
+//! assert_eq!(m.state(), State::Charging);        // Active's initial child
+//! assert_eq!(m.context().0, ["enter Active"]);
+//!
+//! m.process_event(Event::Empty).unwrap();        // cross-boundary move
+//! assert_eq!(m.state(), State::Done);
+//! assert_eq!(m.context().0, ["enter Active", "exit Charging"]);
+//! // note: `enter Active` did NOT fire again on the way out
+//! ```
 
 pub use async_trait::async_trait;
 pub use fsm_rs_macros::state_machine;

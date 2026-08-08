@@ -87,8 +87,10 @@ impl CircuitBreaker {
 ## Semantics (Akka mapping)
 
 All mutable data lives in the context — Akka's `Data`, mutated via `using(...)`,
-maps to actions taking `&mut self`. Rows are tried **in declaration order**; the
-first row whose source, event and guard all match fires.
+maps to actions taking `&mut self`. For each (state, event) pair, rows are
+tried with the **deepest source state first**, ties broken by **declaration
+order** (for flat machines this is simply declaration order); the first row
+whose source, event and guard all match fires.
 
 | fsm-rs | Akka FSM |
 |---|---|
@@ -100,13 +102,100 @@ first row whose source, event and guard all match fires.
 | `on_transition: method` | `onTransition` |
 | `states: { S(entry: f, exit: g) }` | — (Akka FSM has no entry/exit actions) |
 
-A transition with a target runs, in order: action → source `exit` hook →
-state change → target `entry` hook → `on_transition`.
+A transition with a target runs, in order (UML): source `exit` hook(s) →
+action → state change → target `entry` hook(s) → `on_transition`.
 
 If every matching row's guard fails and there is no fallback row and no
 `unhandled:` policy, `process_event` returns
 `Err(TransitionError::Unhandled { state, event })`. Without guards (or with a
 policy) this is unreachable — the `Result` just keeps the API uniform.
+
+## Hierarchical states
+
+States can nest: a composite state wraps child states in braces and must mark
+exactly one initial child with `*`. Hooks work on composites just like on leaf
+states.
+
+```rust
+states: {
+    *Idle,
+    Active(entry: on_active, exit: off_active) {
+        *Charging,
+        Discharging,
+    },
+    Done,
+},
+transitions: {
+    Idle        + PlugIn => Active,   // enters Active's initial: Charging
+    Charging    + Full   => Discharging,
+    Active      + Unplug => Idle,     // matches from ANY leaf inside Active
+    Discharging + Empty  => Done,
+    // ...
+}
+```
+
+The generated `State` enum contains **leaf states only**; composites exist
+purely at definition time. The macro flattens the hierarchy into the plain
+transition table before checking it, so compile-time exhaustiveness, async and
+serde all work exactly as with flat machines.
+
+### Dispatch: child first
+
+A transition source naming a composite covers every leaf inside it. When
+several rows match the same (leaf, event) pair, the row with the **deepest
+source** wins; ties are broken by declaration order. A wildcard `_` source is
+the least specific. Given:
+
+```text
+Active   + Unplug => Idle,     // declared first
+Charging + Unplug => Done,     // still wins for Charging
+```
+
+`Unplug` in `Charging` goes to `Done`, in `Discharging` to `Idle`. This is the
+same child-first bubbling as XState or statig's `Super`, except it is resolved
+at compile time. Guard failure composes with it: if the `Charging` row had a
+guard that evaluates to `false`, the event falls through to the `Active` row,
+then to any wildcard row, then to the `unhandled` policy (or
+`TransitionError::Unhandled`).
+
+### Entry/exit ordering (UML LCA rule)
+
+Hooks fire along the path between source and target through their least common
+ancestor composite: exit hooks from the source up to (excluding) the LCA,
+innermost-first, then the action, then entry hooks from the LCA down to the
+target, outermost-first. Shared ancestors never re-fire. Concretely, for the
+machine above:
+
+| Transition | Hooks fired |
+|---|---|
+| `Idle → Active` | `on_active` (enters initial `Charging`) |
+| `Charging → Discharging` (siblings) | no composite hooks |
+| `Charging → Done` (cross-boundary) | `exit_charging`, `off_active` |
+| `Charging → Charging` (self) | exits/re-enters `Charging` only |
+
+`examples/battery.rs` prints these sequences live.
+
+### Targeting composites
+
+A transition targeting a composite resolves to its initial leaf (recursively),
+including from inside the composite itself (`Charging => Active` re-enters
+`Charging` without touching `Active`'s hooks). The machine's own initial state
+follows the same rule when the top-level `*` marks a composite.
+
+### Persistence with hierarchies
+
+The serialized format is unchanged — the leaf tag only
+(`{"state": "Charging", ...}`), since ancestors are derivable from the
+definition. One caveat: **re-parenting a leaf in a later version is a
+migration hazard** — a stored `Charging` silently changes its entry/exit
+behavior on restore if you move it to another composite.
+
+### Not supported (yet)
+
+History pseudostates (shallow or deep) and orthogonal/parallel regions are
+deliberately out of scope: history changes the persisted format (one "last
+leaf" per composite), and parallel regions break the single-active-state model
+the exhaustiveness check is built on.
 
 ## Async
 
@@ -181,7 +270,9 @@ state_machine! {
     name: MachineName,              // required
     context: ContextType,           // required; plain (non-generic) type
     serde: true,                    // optional; requires the `serde` feature
-    states: { *A, B(entry: f, exit: g) },   // required; one optional `*`
+    states: { *A, B(entry: f, exit: g), C { *D, E } },   // required; nested
+                                                         // blocks allowed, one
+                                                         // `*` per level
     events: { E1, E2 },             // required
     transitions: {                  // required
         A | B + E1 | E2 [async guard] / async action => Target,
@@ -206,7 +297,7 @@ fn on_transition(&mut self, from: &State, to: &State, event: &Event);
 - Timers (`startSingleTimer`-style) — send events from your own tasks for now.
 - Per-state and per-event payloads (data-carrying states/events), including
   per-state serde granularity.
-- Hierarchical states / superstates.
+- History pseudostates and parallel regions (see "Hierarchical states").
 - A batteries-included actor/mailbox runner.
 - Serialization schema evolution.
 
@@ -217,6 +308,7 @@ cargo test --workspace --all-features   # unit + behavior + serde + trybuild
 cargo clippy --workspace --all-features -- -D warnings
 cargo run --example circuit_breaker
 cargo run --example async_job
+cargo run --example battery
 cargo run --example purchase_persist --features serde
 ```
 

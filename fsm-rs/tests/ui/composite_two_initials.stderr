@@ -1,0 +1,5 @@
+error: multiple initial states in composite `P`: `B` and `C`; only one state may be marked with `*`
+ --> tests/ui/composite_two_initials.rs:9:28
+  |
+9 |     states: { *A, P { *B, *C } },
+  |                            ^

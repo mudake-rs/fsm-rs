@@ -13,6 +13,8 @@ pub struct StateDef {
     pub initial: bool,
     pub entry: Option<Callable>,
     pub exit: Option<Callable>,
+    /// Non-empty for composite states.
+    pub children: Vec<StateDef>,
 }
 
 pub struct StateRef {
@@ -67,11 +69,15 @@ pub struct MachineDef {
 impl MachineDef {
     /// All callables referenced anywhere in the definition.
     pub fn callables(&self) -> Vec<&Callable> {
-        let mut out: Vec<&Callable> = Vec::new();
-        for s in &self.states {
-            out.extend(s.entry.iter());
-            out.extend(s.exit.iter());
+        fn collect_states<'a>(states: &'a [StateDef], out: &mut Vec<&'a Callable>) {
+            for s in states {
+                out.extend(s.entry.iter());
+                out.extend(s.exit.iter());
+                collect_states(&s.children, out);
+            }
         }
+        let mut out: Vec<&Callable> = Vec::new();
+        collect_states(&self.states, &mut out);
         for r in &self.transitions {
             out.extend(r.guard.iter());
             out.extend(r.action.iter());

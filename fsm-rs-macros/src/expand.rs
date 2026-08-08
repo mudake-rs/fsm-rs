@@ -6,10 +6,30 @@ use syn::spanned::Spanned;
 use syn::Ident;
 
 use crate::model::*;
+use crate::tree::{find_mut, Tree};
 
-pub fn expand(def: &MachineDef) -> syn::Result<TokenStream> {
+pub fn expand(def: &mut MachineDef) -> syn::Result<TokenStream> {
+    apply_row_initial_markers(def);
     validate(def)?;
     Ok(generate(def))
+}
+
+/// `*` markers on row sources are another way to designate initial states;
+/// fold them into the state definitions so the tree has a single source of
+/// truth.
+fn apply_row_initial_markers(def: &mut MachineDef) {
+    for row in &mut def.transitions {
+        if let SourcePattern::States(refs) = &row.sources {
+            for r in refs {
+                if r.initial_marker {
+                    if let Some(s) = find_mut(&mut def.states, &r.name.to_string()) {
+                        s.initial = true;
+                    }
+                    // Unknown names are reported by validation; nothing to do.
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -53,9 +73,11 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
         ));
     }
 
-    // Duplicate states / events.
+    let tree = Tree::new(&def.states);
+
+    // Duplicate names across the whole tree (one namespace).
     let mut seen_states: HashSet<String> = HashSet::new();
-    for s in &def.states {
+    for s in &tree.all {
         if !seen_states.insert(s.name.to_string()) {
             errors.push(syn::Error::new(
                 s.name.span(),
@@ -70,38 +92,15 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
         }
     }
 
-    // Initial state markers: `*` in the states list or on a row source.
-    let mut starred: Vec<&Ident> = def
-        .states
-        .iter()
-        .filter(|s| s.initial)
-        .map(|s| &s.name)
-        .collect();
-    for row in &def.transitions {
-        if let SourcePattern::States(refs) = &row.sources {
-            starred.extend(refs.iter().filter(|r| r.initial_marker).map(|r| &r.name));
-        }
-    }
-    let first_star = starred.first().map(|i| i.to_string());
-    for s in &starred[starred.len().min(1)..] {
-        if Some(s.to_string()) != first_star {
-            errors.push(syn::Error::new(
-                s.span(),
-                format!(
-                    "multiple initial states: `{}` and `{s}`; only one state may be marked with `*`",
-                    first_star.as_deref().unwrap_or_default()
-                ),
-            ));
-        }
-    }
+    // Initial-state rules: exactly one `*` child per composite; at most one
+    // `*` at the top level (default: first state).
+    check_initial_levels(&def.states, None, &mut errors);
 
     // Unknown states / events in rows.
-    let state_names: HashSet<String> = def.states.iter().map(|s| s.name.to_string()).collect();
-    let event_names: HashSet<String> = def.events.iter().map(|e| e.to_string()).collect();
     for row in &def.transitions {
         if let SourcePattern::States(refs) = &row.sources {
             for r in refs {
-                if !state_names.contains(&r.name.to_string()) {
+                if tree.get(&r.name.to_string()).is_none() {
                     errors.push(syn::Error::new(
                         r.name.span(),
                         format!("unknown state `{}`", r.name),
@@ -111,13 +110,13 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
         }
         if let EventPattern::Events(evs) = &row.events {
             for e in evs {
-                if !event_names.contains(&e.to_string()) {
+                if !seen_events.contains(&e.to_string()) {
                     errors.push(syn::Error::new(e.span(), format!("unknown event `{e}`")));
                 }
             }
         }
         if let Target::State(t) = &row.target {
-            if !state_names.contains(&t.to_string()) {
+            if tree.get(&t.to_string()).is_none() {
                 errors.push(syn::Error::new(t.span(), format!("unknown state `{t}`")));
             }
         }
@@ -130,7 +129,7 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
         let mut note = |c: &Callable, kind: &'static str| {
             callable_kinds.push((c.name.to_string(), kind, c.name.span()));
         };
-        for s in &def.states {
+        for s in &tree.all {
             if let Some(c) = &s.entry {
                 note(c, "entry");
             }
@@ -169,51 +168,59 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
         }
     }
 
-    // Coverage: unreachable rows and exhaustiveness.
-    let state_idx: Vec<String> = def.states.iter().map(|s| s.name.to_string()).collect();
-    let event_idx: Vec<String> = def.events.iter().map(|e| e.to_string()).collect();
+    // Coverage over (leaf x event) pairs.
+    let rows = row_infos(def, &tree);
+    let n_leaves = tree.leaves.len();
+    let n_events = def.events.len();
+
     let mut covered_any: HashSet<(usize, usize)> = HashSet::new();
-    let mut covered_unguarded: HashSet<(usize, usize)> = HashSet::new();
+    for info in &rows {
+        for (l, _) in &info.leaf_specs {
+            for e in &info.ev_idxs {
+                covered_any.insert((*l, *e));
+            }
+        }
+    }
 
-    for row in &def.transitions {
-        let srcs: Vec<usize> = match &row.sources {
-            SourcePattern::Any => (0..state_idx.len()).collect(),
-            SourcePattern::States(refs) => refs
+    // Unreachable rows: within each pair's effective order (specificity desc,
+    // then declaration order), everything after the first unguarded row is
+    // dead for that pair. A row is unreachable when it is dead for every
+    // pair it covers.
+    let mut live_pairs: Vec<HashSet<(usize, usize)>> =
+        rows.iter().map(|_| HashSet::new()).collect();
+    for l in 0..n_leaves {
+        for e in 0..n_events {
+            let mut order: Vec<usize> = rows
                 .iter()
-                .filter_map(|r| state_idx.iter().position(|s| r.name == s.as_str()))
-                .collect(),
-        };
-        let evs: Vec<usize> = match &row.events {
-            EventPattern::Any => (0..event_idx.len()).collect(),
-            EventPattern::Events(ids) => ids
-                .iter()
-                .filter_map(|e| event_idx.iter().position(|x| *e == x.as_str()))
-                .collect(),
-        };
-        let pairs: Vec<(usize, usize)> = srcs
-            .iter()
-            .flat_map(|s| evs.iter().map(move |e| (*s, *e)))
-            .collect();
-
-        if !pairs.is_empty() && pairs.iter().all(|p| covered_unguarded.contains(p)) {
+                .enumerate()
+                .filter(|(_, info)| info.covers(l, e))
+                .map(|(i, _)| i)
+                .collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(rows[i].specificity(l)));
+            for &i in &order {
+                live_pairs[i].insert((l, e));
+                if rows[i].row.guard.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    for (i, info) in rows.iter().enumerate() {
+        let pairs: Vec<(usize, usize)> = info.pairs();
+        if !pairs.is_empty() && pairs.iter().all(|p| !live_pairs[i].contains(p)) {
             errors.push(syn::Error::new(
-                row.span,
+                info.row.span,
                 "unreachable transition: all of its (state, event) pairs are already \
-                 covered by earlier rows without guards",
+                 covered by earlier, more specific rows without guards",
             ));
         }
-
-        if row.guard.is_none() {
-            covered_unguarded.extend(pairs.iter().copied());
-        }
-        covered_any.extend(pairs);
     }
 
     if def.unhandled.is_none() {
-        let missing: Vec<String> = (0..state_idx.len())
-            .flat_map(|s| (0..event_idx.len()).map(move |e| (s, e)))
+        let missing: Vec<String> = (0..n_leaves)
+            .flat_map(|l| (0..n_events).map(move |e| (l, e)))
             .filter(|p| !covered_any.contains(p))
-            .map(|(s, e)| format!("({}, {})", state_idx[s], event_idx[e]))
+            .map(|(l, e)| format!("({}, {})", tree.leaves[l].name, def.events[e]))
             .collect();
         if !missing.is_empty() {
             let shown = missing.len().min(8);
@@ -240,6 +247,120 @@ fn validate(def: &MachineDef) -> syn::Result<()> {
     }
 }
 
+/// A transition row with its expansion over the leaf set precomputed.
+struct RowInfo<'a> {
+    row: &'a Row,
+    /// (leaf index, specificity) — specificity is the depth of the source
+    /// that covers the leaf; wildcard sources count as -1.
+    leaf_specs: Vec<(usize, i32)>,
+    ev_idxs: Vec<usize>,
+}
+
+impl RowInfo<'_> {
+    fn covers(&self, leaf: usize, event: usize) -> bool {
+        self.leaf_specs.iter().any(|(l, _)| *l == leaf) && self.ev_idxs.contains(&event)
+    }
+
+    fn specificity(&self, leaf: usize) -> i32 {
+        self.leaf_specs
+            .iter()
+            .filter(|(l, _)| *l == leaf)
+            .map(|(_, s)| *s)
+            .max()
+            .unwrap_or(i32::MIN)
+    }
+
+    fn pairs(&self) -> Vec<(usize, usize)> {
+        self.leaf_specs
+            .iter()
+            .flat_map(|(l, _)| self.ev_idxs.iter().map(move |e| (*l, *e)))
+            .collect()
+    }
+}
+
+fn row_infos<'a>(def: &'a MachineDef, tree: &Tree) -> Vec<RowInfo<'a>> {
+    def.transitions
+        .iter()
+        .map(|row| {
+            let mut leaf_specs: Vec<(usize, i32)> = Vec::new();
+            let mut add =
+                |idx: usize, spec: i32| match leaf_specs.iter_mut().find(|(l, _)| *l == idx) {
+                    Some(slot) => slot.1 = slot.1.max(spec),
+                    None => leaf_specs.push((idx, spec)),
+                };
+            match &row.sources {
+                SourcePattern::Any => {
+                    for i in 0..tree.leaves.len() {
+                        add(i, -1);
+                    }
+                }
+                SourcePattern::States(refs) => {
+                    for r in refs {
+                        let name = r.name.to_string();
+                        for leaf in tree.leaves_under(&name) {
+                            if let Some(i) = tree.leaves.iter().position(|l| l.name == leaf.name) {
+                                add(i, tree.depth(&name));
+                            }
+                        }
+                    }
+                }
+            }
+            let ev_idxs = match &row.events {
+                EventPattern::Any => (0..def.events.len()).collect(),
+                EventPattern::Events(ids) => ids
+                    .iter()
+                    .filter_map(|e| def.events.iter().position(|x| x == e))
+                    .collect(),
+            };
+            RowInfo {
+                row,
+                leaf_specs,
+                ev_idxs,
+            }
+        })
+        .collect()
+}
+
+/// Initial-state rules, checked per level: exactly one `*` child per
+/// composite; at most one `*` at the top level (default: first state).
+fn check_initial_levels(level: &[StateDef], parent: Option<&Ident>, errors: &mut Vec<syn::Error>) {
+    let starred: Vec<&Ident> = level
+        .iter()
+        .filter(|s| s.initial)
+        .map(|s| &s.name)
+        .collect();
+    let first = starred.first().map(|i| i.to_string());
+    for s in &starred[starred.len().min(1)..] {
+        if Some(s.to_string()) != first {
+            let where_ = match parent {
+                Some(p) => format!("composite `{p}`"),
+                None => "the top level".to_string(),
+            };
+            errors.push(syn::Error::new(
+                s.span(),
+                format!(
+                    "multiple initial states in {where_}: `{}` and `{s}`; \
+                     only one state may be marked with `*`",
+                    first.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+    }
+    if let Some(p) = parent {
+        if starred.is_empty() {
+            errors.push(syn::Error::new(
+                p.span(),
+                format!("composite state `{p}` must mark exactly one initial child with `*`"),
+            ));
+        }
+    }
+    for s in level {
+        if !s.children.is_empty() {
+            check_initial_levels(&s.children, Some(&s.name), errors);
+        }
+    }
+}
+
 fn combine(errors: Vec<syn::Error>) -> syn::Error {
     let mut iter = errors.into_iter();
     let mut acc = iter.next().expect("at least one error");
@@ -247,20 +368,6 @@ fn combine(errors: Vec<syn::Error>) -> syn::Error {
         acc.combine(e);
     }
     acc
-}
-
-fn initial_state(def: &MachineDef) -> &Ident {
-    if let Some(s) = def.states.iter().find(|s| s.initial) {
-        return &s.name;
-    }
-    for row in &def.transitions {
-        if let SourcePattern::States(refs) = &row.sources {
-            if let Some(r) = refs.iter().find(|r| r.initial_marker) {
-                return &r.name;
-            }
-        }
-    }
-    &def.states[0].name
 }
 
 // ---------------------------------------------------------------------------
@@ -278,10 +385,13 @@ enum MethodRole {
 }
 
 fn generate(def: &MachineDef) -> TokenStream {
+    let tree = Tree::new(&def.states);
+    let rows = row_infos(def, &tree);
+
     let name = &def.name;
     let context_ty = &def.context;
     let trait_name = format_ident!("{}Context", name);
-    let initial = initial_state(def);
+    let initial = &tree.initial_leaf(&def.states).name;
     let any_async = def.callables().iter().any(|c| c.is_async);
 
     let serde_attr = def.serde.then(|| {
@@ -293,7 +403,7 @@ fn generate(def: &MachineDef) -> TokenStream {
     let async_trait_attr = any_async.then(|| quote!(#[::fsm_rs::async_trait]));
     let asyncness = any_async.then(|| quote!(async));
 
-    let state_variants: Vec<&Ident> = def.states.iter().map(|s| &s.name).collect();
+    let state_variants: Vec<&Ident> = tree.leaves.iter().map(|s| &s.name).collect();
     let event_variants: Vec<&Ident> = def.events.iter().collect();
 
     // Trait methods, deduplicated by name (validation guarantees consistent roles).
@@ -317,7 +427,7 @@ fn generate(def: &MachineDef) -> TokenStream {
         };
         methods.push(sig);
     };
-    for s in &def.states {
+    for s in &tree.all {
         if let Some(c) = &s.entry {
             push_method(c, MethodRole::Mutation);
         }
@@ -340,12 +450,6 @@ fn generate(def: &MachineDef) -> TokenStream {
         push_method(c, MethodRole::OnTransition);
     }
 
-    let row_blocks: Vec<TokenStream> = def
-        .transitions
-        .iter()
-        .map(|row| row_block(def, row))
-        .collect();
-
     let fallback = match &def.unhandled {
         Some(Unhandled::Ignore) => quote!(Ok(())),
         Some(Unhandled::Method(c)) => {
@@ -362,8 +466,35 @@ fn generate(def: &MachineDef) -> TokenStream {
         })),
     };
 
+    // Per-leaf dispatch arms: rows covering the leaf, in effective order
+    // (more specific sources first, then declaration order).
+    let arms: Vec<TokenStream> = tree
+        .leaves
+        .iter()
+        .enumerate()
+        .map(|(leaf_idx, leaf)| {
+            let leaf_name = &leaf.name;
+            let mut covering: Vec<&RowInfo> = rows
+                .iter()
+                .filter(|info| info.leaf_specs.iter().any(|(l, _)| *l == leaf_idx))
+                .collect();
+            covering.sort_by_key(|info| std::cmp::Reverse(info.specificity(leaf_idx)));
+            let blocks: Vec<TokenStream> = covering
+                .iter()
+                .map(|info| row_block(def, &tree, leaf, info.row))
+                .collect();
+            quote! {
+                State::#leaf_name => {
+                    #(#blocks)*
+                    #fallback
+                }
+            }
+        })
+        .collect();
+
     quote! {
-        /// States of the generated state machine.
+        /// States of the generated state machine (leaf states of the
+        /// hierarchy).
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #serde_attr
         pub enum State {
@@ -400,7 +531,7 @@ fn generate(def: &MachineDef) -> TokenStream {
                 }
             }
 
-            /// The current state.
+            /// The current state (a leaf state of the hierarchy).
             pub fn state(&self) -> State {
                 self.state
             }
@@ -415,16 +546,17 @@ fn generate(def: &MachineDef) -> TokenStream {
                 &mut self.context
             }
 
-            /// Processes an event: runs the first matching transition's action
-            /// and moves the machine to the target state.
+            /// Processes an event: runs the first matching transition and
+            /// moves the machine to the target state.
             #[allow(unused_variables)]
             pub #asyncness fn process_event(
                 &mut self,
                 event: Event,
             ) -> ::core::result::Result<(), ::fsm_rs::TransitionError<State, Event>> {
                 let from = self.state;
-                #(#row_blocks)*
-                #fallback
+                match from {
+                    #(#arms)*
+                }
             }
         }
     }
@@ -434,32 +566,16 @@ fn await_tokens(c: &Callable) -> Option<TokenStream> {
     c.is_async.then(|| quote!(.await))
 }
 
-fn row_block(def: &MachineDef, row: &Row) -> TokenStream {
-    let src_cond = match &row.sources {
-        SourcePattern::Any => None,
-        SourcePattern::States(refs) => {
-            let pats: Vec<TokenStream> = refs
-                .iter()
-                .map(|r| {
-                    let n = &r.name;
-                    quote!(State::#n)
-                })
-                .collect();
-            Some(quote!(matches!(from, #(#pats)|*)))
-        }
-    };
+/// The dispatch block for one row within one leaf state's arm. The source
+/// leaf is statically known here, so entry/exit hook sequences are fully
+/// expanded.
+fn row_block(def: &MachineDef, tree: &Tree, leaf: &StateDef, row: &Row) -> TokenStream {
     let ev_cond = match &row.events {
         EventPattern::Any => None,
         EventPattern::Events(ids) => {
             let pats: Vec<TokenStream> = ids.iter().map(|e| quote!(Event::#e)).collect();
             Some(quote!(matches!(event, #(#pats)|*)))
         }
-    };
-    let cond = match (src_cond, ev_cond) {
-        (Some(s), Some(e)) => quote!(#s && #e),
-        (Some(s), None) => quote!(#s),
-        (None, Some(e)) => quote!(#e),
-        (None, None) => quote!(true),
     };
 
     let action = row.action.as_ref().map(|c| {
@@ -471,27 +587,39 @@ fn row_block(def: &MachineDef, row: &Row) -> TokenStream {
     let body = match &row.target {
         Target::Stay => quote!(#action),
         Target::State(target) => {
-            let exit = exit_code(def, row);
-            let entry = def
-                .states
+            let target_leaf = tree.resolve_initial(&target.to_string());
+            let target_name = &target_leaf.name;
+
+            let exit_calls: Vec<TokenStream> = tree
+                .exit_path(&leaf.name.to_string(), &target_name.to_string())
                 .iter()
-                .find(|s| s.name == *target)
-                .and_then(|s| s.entry.as_ref())
+                .filter_map(|s| s.exit.as_ref())
                 .map(|c| {
                     let m = &c.name;
                     let aw = await_tokens(c);
                     quote!(self.context.#m()#aw;)
-                });
+                })
+                .collect();
+            let entry_calls: Vec<TokenStream> = tree
+                .entry_path(&leaf.name.to_string(), &target_name.to_string())
+                .iter()
+                .filter_map(|s| s.entry.as_ref())
+                .map(|c| {
+                    let m = &c.name;
+                    let aw = await_tokens(c);
+                    quote!(self.context.#m()#aw;)
+                })
+                .collect();
             let on_transition = def.on_transition.as_ref().map(|c| {
                 let m = &c.name;
                 let aw = await_tokens(c);
                 quote!(self.context.#m(&from, &self.state, &event)#aw;)
             });
             quote! {
+                #(#exit_calls)*
                 #action
-                #exit
-                self.state = State::#target;
-                #entry
+                self.state = State::#target_name;
+                #(#entry_calls)*
                 #on_transition
             }
         }
@@ -514,45 +642,12 @@ fn row_block(def: &MachineDef, row: &Row) -> TokenStream {
         }
     };
 
-    quote! {
-        if #cond {
-            #inner
-        }
-    }
-}
-
-/// Exit-hook dispatch for a transition leaving its source state(s).
-fn exit_code(def: &MachineDef, row: &Row) -> TokenStream {
-    let candidates: Vec<&StateDef> = match &row.sources {
-        SourcePattern::Any => def.states.iter().collect(),
-        SourcePattern::States(refs) => def
-            .states
-            .iter()
-            .filter(|s| refs.iter().any(|r| r.name == s.name))
-            .collect(),
-    };
-    let with_exit: Vec<&&StateDef> = candidates.iter().filter(|s| s.exit.is_some()).collect();
-    if with_exit.is_empty() {
-        return quote!();
-    }
-    if candidates.len() == 1 {
-        let c = with_exit[0].exit.as_ref().expect("filtered above");
-        let m = &c.name;
-        let aw = await_tokens(c);
-        return quote!(self.context.#m()#aw;);
-    }
-    let arms = with_exit.iter().map(|s| {
-        let state_name = &s.name;
-        let c = s.exit.as_ref().expect("filtered above");
-        let m = &c.name;
-        let aw = await_tokens(c);
-        quote!(State::#state_name => self.context.#m()#aw,)
-    });
-    quote! {
-        match from {
-            #(#arms)*
-            #[allow(unreachable_patterns)]
-            _ => {}
-        }
+    match ev_cond {
+        Some(cond) => quote! {
+            if #cond {
+                #inner
+            }
+        },
+        None => inner,
     }
 }

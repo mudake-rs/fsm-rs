@@ -1,0 +1,5 @@
+error: composite state `P` must mark exactly one initial child with `*`
+ --> tests/ui/composite_no_initial.rs:9:19
+  |
+9 |     states: { *A, P { B, C } },
+  |                   ^
